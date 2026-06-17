@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Player Stats Tracker</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #ffffff; }
+  input, textarea, button { font-family: inherit; }
+  button { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React (UMD builds, no bundler needed) -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel standalone lets us write JSX directly in the browser -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase + React app, compiled by Babel-standalone as a single ES module.
+     Using data-type="module" lets this script use native `import` statements
+     while still being transformed for JSX by Babel. Keeping everything in one
+     script avoids cross-script timing issues between Firebase init and the
+     React app mounting. -->
+<script type="text/babel" data-type="module" data-presets="react">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+import {
+  getAuth, onAuthStateChanged, signInWithEmailAndPassword,
+  createUserWithEmailAndPassword, signOut
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDocs, setDoc,
+  deleteDoc, getDoc
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB6jfKfsMrMqgw9dsilAynKU4dyl_g6Db8",
+  authDomain: "stattracker-fe5c7.firebaseapp.com",
+  projectId: "stattracker-fe5c7",
+  storageBucket: "stattracker-fe5c7.firebasestorage.app",
+  messagingSenderId: "37235883576",
+  appId: "1:37235883576:web:9629f10c98c19c65c130cd"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+
+const __fb = {
+  auth, db,
+  onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut,
+  collection, doc, getDocs, setDoc, deleteDoc, getDoc
+};
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+const COLORS = {
+  bgPrimary: "#ffffff", bgSecondary: "#f4f5f7",
+  borderTertiary: "#e7e8eb", borderSecondary: "#d8dade",
+  textPrimary: "#1a1c1f", textSecondary: "#6b7078", textTertiary: "#9a9ea5",
+  success: "#1d9e75", successBg: "#e7f6f0",
+  danger: "#d23b3b", dangerBg: "#fbebeb",
+};
+
+const SEASONS = [
+  { id: "summer_school", label: "Summer School", icon: "🏫", color: "#1D9E75" },
+  { id: "summer_travel", label: "Summer Travel", icon: "📍", color: "#378ADD" },
+  { id: "winter_school", label: "Winter School", icon: "❄️", color: "#7F77DD" },
+];
+
+const SHOT_TYPES = [
+  { id: "layup", label: "Layup", pts: 2 },
+  { id: "mid",   label: "Mid-range", pts: 2 },
+  { id: "three", label: "3-pointer", pts: 3 },
+  { id: "ft",    label: "Free throw", pts: 1 },
+  { id: "dunk",  label: "Dunk", pts: 2 },
+];
+
+const defaultGame = () => ({
+  id: Date.now().toString(),
+  date: new Date().toISOString().split("T")[0],
+  opponent: "",
+  season: "summer_school",
+  shots: [],
+  rebounds: { off: 0, def: 0 },
+  steals: 0,
+  deflections: 0,
+  assists: 0,
+  turnovers: 0,
+  notes: "",
+});
+
+const calcGameStats = (game) => {
+  const pts = game.shots.filter((s) => s.made).reduce((sum, s) => {
+    const t = SHOT_TYPES.find((st) => st.id === s.type);
+    return sum + (t ? t.pts : 0);
+  }, 0);
+  const fg = game.shots.filter((s) => s.type !== "ft");
+  const fgMade = fg.filter((s) => s.made);
+  const ftShots = game.shots.filter((s) => s.type === "ft");
+  const ftMade = ftShots.filter((s) => s.made);
+  const threeA = game.shots.filter((s) => s.type === "three").length;
+  const threeM = game.shots.filter((s) => s.type === "three" && s.made).length;
+  const ast = game.assists ?? 0;
+  const to = game.turnovers ?? 0;
+  return {
+    pts,
+    fga: fg.length, fgm: fgMade.length,
+    fgPct: fg.length ? Math.round((fgMade.length / fg.length) * 100) : 0,
+    fta: ftShots.length, ftm: ftMade.length,
+    ftPct: ftShots.length ? Math.round((ftMade.length / ftShots.length) * 100) : 0,
+    threeA, threeM,
+    threePct: threeA ? Math.round((threeM / threeA) * 100) : 0,
+    reb: game.rebounds.off + game.rebounds.def,
+    oreb: game.rebounds.off, dreb: game.rebounds.def,
+    stl: game.steals ?? 0, dfl: game.deflections ?? 0,
+    ast, to,
+    astToRatio: to > 0 ? (ast / to).toFixed(1) : ast > 0 ? "∞" : "—",
+  };
+};
+
+const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+
+// ─── Firestore helpers (using the real Firebase SDK, no sandbox restrictions) ─
+function fb() { return __fb; }
+
+async function fsListGames(uid) {
+  try {
+    const { db, collection, getDocs } = fb();
+    const snap = await getDocs(collection(db, "users", uid, "games"));
+    return { ok: true, games: snap.docs.map((d) => d.data()) };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e), games: [] };
+  }
+}
+async function fsSaveGame(uid, game) {
+  try {
+    const { db, doc, setDoc } = fb();
+    await setDoc(doc(db, "users", uid, "games", game.id), game);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+async function fsDeleteGame(uid, id) {
+  try {
+    const { db, doc, deleteDoc } = fb();
+    await deleteDoc(doc(db, "users", uid, "games", id));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+async function fsSaveLiveGame(uid, game) {
+  try {
+    const { db, doc, setDoc, deleteDoc } = fb();
+    const ref = doc(db, "users", uid, "meta", "live_game");
+    if (!game) { await deleteDoc(ref); return { ok: true }; }
+    await setDoc(ref, game);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+async function fsGetLiveGame(uid) {
+  try {
+    const { db, doc, getDoc } = fb();
+    const snap = await getDoc(doc(db, "users", uid, "meta", "live_game"));
+    return { ok: true, game: snap.exists() ? snap.data() : null };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e), game: null };
+  }
+}
+
+// ─── Auth screen ───────────────────────────────────────────────────────────
+function AuthScreen({ onSignedIn }) {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    const { auth, signInWithEmailAndPassword, createUserWithEmailAndPassword } = fb();
+    try {
+      if (mode === "signin") {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ maxWidth: 360, margin: "4rem auto", padding: "0 1rem" }}>
+      <div style={{ textAlign: "center", marginBottom: "1.5rem" }}>
+        <div style={{ width: 48, height: 48, borderRadius: "50%", background: "#D85A30", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+          <span style={{ fontSize: 24 }}>🏀</span>
+        </div>
+        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 500, color: COLORS.textPrimary }}>Player Stats Tracker</h1>
+        <p style={{ margin: "4px 0 0", fontSize: 13, color: COLORS.textSecondary }}>
+          {mode === "signin" ? "Sign in to your stats" : "Create an account"}
+        </p>
+      </div>
+
+      <form onSubmit={submit}>
+        <label style={{ fontSize: 13, color: COLORS.textSecondary, display: "block", marginBottom: 4 }}>Email</label>
+        <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+          style={{ width: "100%", fontSize: 14, padding: "10px 12px", borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, marginBottom: 12, boxSizing: "border-box" }} />
+
+        <label style={{ fontSize: 13, color: COLORS.textSecondary, display: "block", marginBottom: 4 }}>Password</label>
+        <input type="password" required minLength={6} value={password} onChange={(e) => setPassword(e.target.value)}
+          style={{ width: "100%", fontSize: 14, padding: "10px 12px", borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, marginBottom: 12, boxSizing: "border-box" }} />
+
+        {error && (
+          <div style={{ background: COLORS.dangerBg, border: `0.5px solid ${COLORS.danger}`, borderRadius: 8, padding: "8px 12px", marginBottom: 12, fontSize: 12, color: COLORS.danger }}>
+            {error}
+          </div>
+        )}
+
+        <button type="submit" disabled={busy} style={{ width: "100%", padding: "12px 0", borderRadius: 8, border: "none", background: "#D85A30", color: "#fff", fontWeight: 500, fontSize: 15, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>
+          {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}
+        </button>
+      </form>
+
+      <p style={{ textAlign: "center", fontSize: 13, color: COLORS.textSecondary, marginTop: 16 }}>
+        {mode === "signin" ? "Don't have an account? " : "Already have an account? "}
+        <button onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setError(null); }}
+          style={{ background: "none", border: "none", color: "#D85A30", cursor: "pointer", fontWeight: 500, padding: 0, fontSize: 13 }}>
+          {mode === "signin" ? "Create one" : "Sign in"}
+        </button>
+      </p>
+    </div>
+  );
+}
+
+// ─── Main App (post-login) ─────────────────────────────────────────────────
+function MainApp({ user }) {
+  const [view, setView] = useState("overview");
+  const [activeSeason, setActiveSeason] = useState("summer_school");
+  const [games, setGames] = useState([]);
+  const [currentGame, setCurrentGame] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(null);
+  const [saveError, setSaveError] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const gamesResult = await fsListGames(user.uid);
+      if (gamesResult.ok) setGames(gamesResult.games);
+      else setLoadError(gamesResult.error);
+
+      const liveResult = await fsGetLiveGame(user.uid);
+      if (liveResult.ok && liveResult.game && liveResult.game.id) {
+        setCurrentGame(liveResult.game);
+        setView("live");
+      } else if (!liveResult.ok) {
+        setLoadError((prev) => prev || liveResult.error);
+      }
+      setLoaded(true);
+    })();
+  }, [user.uid]);
+
+  const flashStatus = (ok, err) => {
+    setSaveStatus(ok ? "saved" : "error");
+    setSaveError(ok ? null : err);
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => setSaveStatus(null), ok ? 2000 : 8000);
+  };
+
+  const persistGame = async (game) => {
+    setSaveStatus("saving");
+    const result = await fsSaveGame(user.uid, game);
+    flashStatus(result.ok, result.error);
+    return result.ok;
+  };
+
+  const updateGames = (g, changedGame) => {
+    setGames(g);
+    if (changedGame) persistGame(changedGame);
+  };
+
+  const updateCurrentGame = (g) => {
+    setCurrentGame(g);
+    if (g) fsSaveLiveGame(user.uid, g).then((r) => { if (!r.ok) flashStatus(false, r.error); });
+  };
+
+  const startNewGame = () => {
+    const g = { ...defaultGame(), season: activeSeason };
+    updateCurrentGame(g);
+    setView("live");
+  };
+
+  const finishGame = () => {
+    if (!currentGame) return;
+    const updated = [...games.filter((g) => g.id !== currentGame.id), currentGame];
+    updateGames(updated, currentGame);
+    fsSaveLiveGame(user.uid, null);
+    setCurrentGame(null);
+    setView("history");
+  };
+
+  const discardGame = () => {
+    fsSaveLiveGame(user.uid, null);
+    setCurrentGame(null);
+    setView("history");
+  };
+
+  const deleteGame = async (id) => {
+    setGames(games.filter((g) => g.id !== id));
+    setSaveStatus("saving");
+    const result = await fsDeleteGame(user.uid, id);
+    flashStatus(result.ok, result.error);
+  };
+
+  const seasonGames = (sid) => games.filter((g) => g.season === sid);
+
+  const handleSignOut = () => {
+    const { auth, signOut } = fb();
+    signOut(auth);
+  };
+
+  if (!loaded) {
+    return <div style={{ padding: "3rem", textAlign: "center", color: COLORS.textSecondary }}><p>Loading your stats…</p></div>;
+  }
+
+  return (
+    <div style={{ maxWidth: 700, margin: "0 auto", padding: "1rem", background: COLORS.bgPrimary }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1.5rem", paddingBottom: "1rem", borderBottom: `0.5px solid ${COLORS.borderTertiary}` }}>
+        <div style={{ width: 40, height: 40, borderRadius: "50%", background: "#D85A30", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <span style={{ fontSize: 20 }}>🏀</span>
+        </div>
+        <div style={{ flex: 1 }}>
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 500, color: COLORS.textPrimary }}>Player Stats Tracker</h1>
+          <p style={{ margin: 0, fontSize: 13, color: COLORS.textSecondary }}>{user.email}</p>
+        </div>
+        {saveStatus && (
+          <span style={{ fontSize: 12, color: saveStatus === "error" ? COLORS.danger : saveStatus === "saving" ? COLORS.textSecondary : COLORS.success, marginRight: 8 }}>
+            {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "✓ Saved" : "⚠ Error"}
+          </span>
+        )}
+        <button onClick={handleSignOut} style={{ fontSize: 12, color: COLORS.textSecondary, background: "none", border: `0.5px solid ${COLORS.borderSecondary}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer" }}>
+          Sign out
+        </button>
+      </div>
+
+      {(saveError || loadError) && (
+        <div style={{ background: COLORS.dangerBg, border: `0.5px solid ${COLORS.danger}`, borderRadius: 8, padding: "10px 14px", marginBottom: "1rem", fontSize: 12, color: COLORS.danger, wordBreak: "break-word" }}>
+          <strong>{saveError ? "Save error: " : "Load error: "}</strong>{saveError || loadError}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginBottom: "1.5rem", flexWrap: "wrap" }}>
+        {[
+          { id: "overview", label: "Season overview" },
+          { id: "live", label: currentGame ? "Live game" : "New game" },
+          { id: "history", label: "Game history" },
+        ].map((n) => (
+          <button key={n.id} onClick={() => { if (n.id === "live" && !currentGame) startNewGame(); else setView(n.id); }}
+            style={{ padding: "8px 16px", borderRadius: 8, border: view === n.id ? "1.5px solid #D85A30" : `0.5px solid ${COLORS.borderSecondary}`, background: view === n.id ? "rgba(216,90,48,0.08)" : COLORS.bgPrimary, color: view === n.id ? "#993C1D" : COLORS.textPrimary, fontWeight: view === n.id ? 500 : 400, cursor: "pointer", fontSize: 14 }}>
+            {n.label}
+          </button>
+        ))}
+      </div>
+
+      {view !== "live" && (
+        <div style={{ display: "flex", gap: 6, marginBottom: "1.5rem" }}>
+          {SEASONS.map((s) => (
+            <button key={s.id} onClick={() => setActiveSeason(s.id)}
+              style={{ flex: 1, padding: "8px 4px", borderRadius: 8, border: activeSeason === s.id ? `1.5px solid ${s.color}` : `0.5px solid ${COLORS.borderTertiary}`, background: activeSeason === s.id ? `${s.color}18` : COLORS.bgSecondary, color: activeSeason === s.id ? s.color : COLORS.textSecondary, fontWeight: activeSeason === s.id ? 500 : 400, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <span>{s.icon}</span>{s.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {view === "overview" && <OverviewView games={seasonGames(activeSeason)} season={SEASONS.find((s) => s.id === activeSeason)} />}
+      {view === "live" && <LiveGameView game={currentGame} setGame={updateCurrentGame} onFinish={finishGame} onCancel={discardGame} />}
+      {view === "history" && (
+        <HistoryView
+          games={seasonGames(activeSeason)}
+          season={SEASONS.find((s) => s.id === activeSeason)}
+          onDelete={deleteGame}
+        />
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, highlight }) {
+  return (
+    <div style={{ background: COLORS.bgSecondary, borderRadius: 8, padding: "14px 16px" }}>
+      <p style={{ margin: "0 0 4px", fontSize: 12, color: COLORS.textSecondary }}>{label}</p>
+      <p style={{ margin: 0, fontSize: 24, fontWeight: 500, color: highlight ?? COLORS.textPrimary }}>{value}</p>
+      {sub && <p style={{ margin: "2px 0 0", fontSize: 11, color: COLORS.textTertiary }}>{sub}</p>}
+    </div>
+  );
+}
+
+function OverviewView({ games, season }) {
+  if (!games.length) {
+    return (
+      <div style={{ textAlign: "center", padding: "3rem 1rem", color: COLORS.textSecondary }}>
+        <p style={{ fontSize: 40, margin: "0 0 12px" }}>📋</p>
+        <p style={{ fontWeight: 500, color: COLORS.textPrimary }}>No games logged yet</p>
+        <p style={{ fontSize: 14 }}>Start tracking games to see season averages here.</p>
+      </div>
+    );
+  }
+  const allStats = games.map(calcGameStats);
+  const gp = games.length;
+  const avgStat = (key) => avg(allStats.map((s) => s[key])).toFixed(1);
+  const totalAst = allStats.reduce((s, x) => s + x.ast, 0);
+  const totalTo = allStats.reduce((s, x) => s + x.to, 0);
+  const seasonAstTo = totalTo > 0 ? (totalAst / totalTo).toFixed(1) : totalAst > 0 ? "∞" : "—";
+  const avgThreePct = (() => {
+    const totalA = games.reduce((s, g) => s + g.shots.filter((sh) => sh.type === "three").length, 0);
+    const totalM = games.reduce((s, g) => s + g.shots.filter((sh) => sh.type === "three" && sh.made).length, 0);
+    return totalA ? Math.round((totalM / totalA) * 100) : 0;
+  })();
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem" }}>
+        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 500, color: COLORS.textPrimary }}>Season averages</h2>
+        <span style={{ fontSize: 13, color: COLORS.textSecondary }}>{gp} game{gp !== 1 ? "s" : ""}</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: "1.5rem" }}>
+        <StatCard label="Points" value={avgStat("pts")} sub="per game" />
+        <StatCard label="FG%" value={`${Math.round(avg(allStats.map((s) => s.fgPct)))}%`} sub={`${avgStat("fgm")}/${avgStat("fga")} avg`} />
+        <StatCard label="3PT%" value={`${avgThreePct}%`} sub={`${avgStat("threeM")}/${avgStat("threeA")} avg`} highlight={season.color} />
+        <StatCard label="FT%" value={`${Math.round(avg(allStats.map((s) => s.ftPct)))}%`} sub={`${avgStat("ftm")}/${avgStat("fta")} avg`} />
+        <StatCard label="Rebounds" value={avgStat("reb")} sub={`${avgStat("oreb")} off / ${avgStat("dreb")} def`} />
+        <StatCard label="Assists" value={avgStat("ast")} sub="per game" />
+        <StatCard label="Turnovers" value={avgStat("to")} sub="per game" highlight={COLORS.danger} />
+        <StatCard label="AST/TO" value={seasonAstTo} sub="season ratio" highlight={COLORS.success} />
+        <StatCard label="Steals" value={avgStat("stl")} sub="per game" />
+        <StatCard label="Deflections" value={avgStat("dfl")} sub="per game" />
+      </div>
+
+      <div style={{ background: COLORS.bgPrimary, border: `0.5px solid ${COLORS.borderTertiary}`, borderRadius: 12, padding: "1rem 1.25rem", marginBottom: "1rem" }}>
+        <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 500 }}>Shot breakdown (season)</h3>
+        {SHOT_TYPES.map((st) => {
+          const totalA = games.reduce((tot, g) => tot + g.shots.filter((sh) => sh.type === st.id).length, 0);
+          const totalM = games.reduce((tot, g) => tot + g.shots.filter((sh) => sh.type === st.id && sh.made).length, 0);
+          const pct = totalA ? Math.round((totalM / totalA) * 100) : 0;
+          return (
+            <div key={st.id} style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+              <span style={{ fontSize: 13, color: COLORS.textSecondary, width: 80, flexShrink: 0 }}>{st.label}</span>
+              <div style={{ flex: 1, height: 6, background: COLORS.bgSecondary, borderRadius: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${pct}%`, background: season.color, borderRadius: 3 }} />
+              </div>
+              <span style={{ fontSize: 12, color: COLORS.textSecondary, width: 80, textAlign: "right", flexShrink: 0 }}>{totalM}/{totalA} ({pct}%)</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ background: COLORS.bgPrimary, border: `0.5px solid ${COLORS.borderTertiary}`, borderRadius: 12, padding: "1rem 1.25rem" }}>
+        <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 500 }}>Recent games</h3>
+        <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", tableLayout: "fixed" }}>
+          <thead>
+            <tr style={{ color: COLORS.textSecondary }}>
+              <th style={{ textAlign: "left", fontWeight: 400, paddingBottom: 8, width: "22%" }}>Date</th>
+              <th style={{ textAlign: "left", fontWeight: 400, paddingBottom: 8, width: "22%" }}>Opponent</th>
+              <th style={{ textAlign: "right", fontWeight: 400, paddingBottom: 8, width: "10%" }}>PTS</th>
+              <th style={{ textAlign: "right", fontWeight: 400, paddingBottom: 8, width: "10%" }}>REB</th>
+              <th style={{ textAlign: "right", fontWeight: 400, paddingBottom: 8, width: "10%" }}>AST</th>
+              <th style={{ textAlign: "right", fontWeight: 400, paddingBottom: 8, width: "10%" }}>TO</th>
+              <th style={{ textAlign: "right", fontWeight: 400, paddingBottom: 8, width: "16%" }}>3PT%</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...games].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5).map((g) => {
+              const s = calcGameStats(g);
+              return (
+                <tr key={g.id} style={{ borderTop: `0.5px solid ${COLORS.borderTertiary}` }}>
+                  <td style={{ padding: "8px 0", color: COLORS.textSecondary }}>{g.date}</td>
+                  <td style={{ padding: "8px 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.opponent || "—"}</td>
+                  <td style={{ textAlign: "right", fontWeight: 500, color: season.color }}>{s.pts}</td>
+                  <td style={{ textAlign: "right" }}>{s.reb}</td>
+                  <td style={{ textAlign: "right" }}>{s.ast}</td>
+                  <td style={{ textAlign: "right", color: COLORS.danger }}>{s.to}</td>
+                  <td style={{ textAlign: "right", color: COLORS.textSecondary }}>{s.threePct}%</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function LiveGameView({ game, setGame, onFinish, onCancel }) {
+  const [lastAction, setLastAction] = useState(null);
+  if (!game) return null;
+
+  const logShot = (type, made) => {
+    const shot = { id: Date.now().toString(), type, made };
+    setGame({ ...game, shots: [...game.shots, shot] });
+    setLastAction(`${made ? "Made" : "Missed"} — ${SHOT_TYPES.find((s) => s.id === type).label}`);
+    setTimeout(() => setLastAction(null), 1500);
+  };
+  const undoLast = () => setGame({ ...game, shots: game.shots.slice(0, -1) });
+  const inc = (key, sub) => {
+    if (sub) setGame({ ...game, rebounds: { ...game.rebounds, [sub]: game.rebounds[sub] + 1 } });
+    else setGame({ ...game, [key]: (game[key] ?? 0) + 1 });
+  };
+  const dec = (key, sub) => {
+    if (sub) setGame({ ...game, rebounds: { ...game.rebounds, [sub]: Math.max(0, game.rebounds[sub] - 1) } });
+    else setGame({ ...game, [key]: Math.max(0, (game[key] ?? 0) - 1) });
+  };
+  const s = calcGameStats(game);
+  const season = SEASONS.find((x) => x.id === game.season) || SEASONS[0];
+
+  return (
+    <div>
+      <div style={{ background: COLORS.bgSecondary, borderRadius: 12, padding: "12px 16px", marginBottom: "1rem", display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 140 }}>
+          <label style={{ fontSize: 11, color: COLORS.textSecondary, display: "block", marginBottom: 4 }}>Date</label>
+          <input type="date" value={game.date} onChange={(e) => setGame({ ...game, date: e.target.value })}
+            style={{ fontSize: 13, width: "100%", boxSizing: "border-box", padding: "4px 6px", borderRadius: 6, border: `0.5px solid ${COLORS.borderSecondary}` }} />
+        </div>
+        <div style={{ flex: 2, minWidth: 160 }}>
+          <label style={{ fontSize: 11, color: COLORS.textSecondary, display: "block", marginBottom: 4 }}>Opponent</label>
+          <input type="text" value={game.opponent} onChange={(e) => setGame({ ...game, opponent: e.target.value })} placeholder="Opponent name"
+            style={{ fontSize: 13, width: "100%", boxSizing: "border-box", padding: "4px 6px", borderRadius: 6, border: `0.5px solid ${COLORS.borderSecondary}` }} />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", padding: "12px 16px", background: `${season.color}15`, borderRadius: 12, border: `0.5px solid ${season.color}40` }}>
+        <div><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>Points</p><p style={{ margin: 0, fontSize: 36, fontWeight: 500, color: season.color }}>{s.pts}</p></div>
+        <div style={{ textAlign: "center" }}><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>3PT</p><p style={{ margin: 0, fontSize: 20, fontWeight: 500 }}>{s.threeM}/{s.threeA}</p><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>{s.threePct}%</p></div>
+        <div style={{ textAlign: "center" }}><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>AST/TO</p><p style={{ margin: 0, fontSize: 20, fontWeight: 500 }}>{s.astToRatio}</p><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>{s.ast} ast / {s.to} to</p></div>
+        <div style={{ textAlign: "right" }}><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>FG</p><p style={{ margin: 0, fontSize: 20, fontWeight: 500 }}>{s.fgm}/{s.fga}</p><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>{s.fgPct}%</p></div>
+      </div>
+
+      {lastAction && (
+        <div style={{ textAlign: "center", marginBottom: 8, fontSize: 14, fontWeight: 500, color: lastAction.startsWith("Made") ? COLORS.success : COLORS.danger }}>{lastAction}</div>
+      )}
+
+      <div style={{ background: COLORS.bgPrimary, border: `0.5px solid ${COLORS.borderTertiary}`, borderRadius: 12, padding: "1rem 1.25rem", marginBottom: "1rem" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 500 }}>Log a shot</h3>
+          {game.shots.length > 0 && <button onClick={undoLast} style={{ fontSize: 12, color: COLORS.textSecondary, background: "none", border: "none", cursor: "pointer", padding: 0 }}>↩ Undo last</button>}
+        </div>
+        {SHOT_TYPES.map((st) => {
+          const att = game.shots.filter((sh) => sh.type === st.id).length;
+          const made = game.shots.filter((sh) => sh.type === st.id && sh.made).length;
+          return (
+            <div key={st.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+              <span style={{ fontSize: 13, color: COLORS.textSecondary, width: 90, flexShrink: 0 }}>{st.label}</span>
+              <div style={{ display: "flex", gap: 8, flex: 1 }}>
+                <button onClick={() => logShot(st.id, true)} style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, background: COLORS.successBg, color: COLORS.success, cursor: "pointer", fontSize: 13, fontWeight: 500 }}>✓ Make</button>
+                <button onClick={() => logShot(st.id, false)} style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, background: COLORS.dangerBg, color: COLORS.danger, cursor: "pointer", fontSize: 13, fontWeight: 500 }}>✕ Miss</button>
+              </div>
+              <span style={{ fontSize: 12, color: COLORS.textSecondary, width: 60, textAlign: "right", flexShrink: 0 }}>{made}/{att}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ background: COLORS.bgPrimary, border: `0.5px solid ${COLORS.borderTertiary}`, borderRadius: 12, padding: "1rem 1.25rem", marginBottom: "1rem" }}>
+        <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 500 }}>Other stats</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+          {[
+            { label: "Off. rebounds", key: "rebounds", sub: "off", val: game.rebounds.off },
+            { label: "Def. rebounds", key: "rebounds", sub: "def", val: game.rebounds.def },
+            { label: "Assists", key: "assists", val: game.assists ?? 0 },
+            { label: "Turnovers", key: "turnovers", val: game.turnovers ?? 0, warn: true },
+            { label: "Steals", key: "steals", val: game.steals ?? 0 },
+            { label: "Deflections", key: "deflections", val: game.deflections ?? 0 },
+          ].map((item) => (
+            <div key={item.label} style={{ background: COLORS.bgSecondary, borderRadius: 8, padding: "12px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <div><p style={{ margin: 0, fontSize: 11, color: COLORS.textSecondary }}>{item.label}</p><p style={{ margin: 0, fontSize: 22, fontWeight: 500, color: item.warn ? COLORS.danger : COLORS.textPrimary }}>{item.val}</p></div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <button onClick={() => inc(item.key, item.sub)} style={{ width: 30, height: 30, borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, background: COLORS.bgPrimary, cursor: "pointer", fontSize: 16, fontWeight: 500 }}>+</button>
+                <button onClick={() => dec(item.key, item.sub)} style={{ width: 30, height: 30, borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, background: COLORS.bgPrimary, cursor: "pointer", fontSize: 18 }}>−</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ marginTop: 12, padding: "10px 14px", background: `${COLORS.success}12`, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 13, color: COLORS.textSecondary }}>Assist-to-turnover ratio</span>
+          <span style={{ fontSize: 18, fontWeight: 500, color: COLORS.success }}>{s.astToRatio}</span>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <label style={{ fontSize: 13, color: COLORS.textSecondary, display: "block", marginBottom: 6 }}>Notes (optional)</label>
+        <textarea value={game.notes} onChange={(e) => setGame({ ...game, notes: e.target.value })} placeholder="Add game notes…" rows={2}
+          style={{ width: "100%", fontSize: 13, borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, padding: "8px 12px", resize: "vertical", boxSizing: "border-box" }} />
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <button onClick={onFinish} style={{ flex: 2, padding: "12px 0", borderRadius: 8, border: `1.5px solid ${season.color}`, background: season.color, color: "#fff", fontWeight: 500, cursor: "pointer", fontSize: 15 }}>Save game</button>
+        <button onClick={onCancel} style={{ flex: 1, padding: "12px 0", borderRadius: 8, border: `0.5px solid ${COLORS.borderSecondary}`, background: "none", color: COLORS.textSecondary, cursor: "pointer", fontSize: 14 }}>Discard</button>
+      </div>
+    </div>
+  );
+}
+
+function HistoryView({ games, season, onDelete }) {
+  const [expandedId, setExpandedId] = useState(null);
+  const sorted = [...games].sort((a, b) => b.date.localeCompare(a.date));
+  if (!sorted.length) {
+    return (
+      <div style={{ textAlign: "center", padding: "3rem 1rem", color: COLORS.textSecondary }}>
+        <p style={{ fontSize: 40, margin: "0 0 12px" }}>🕓</p>
+        <p style={{ fontWeight: 500, color: COLORS.textPrimary }}>No games yet this season</p>
+        <p style={{ fontSize: 14 }}>Log your first game using "New game" above.</p>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <h2 style={{ margin: "0 0 1rem", fontSize: 16, fontWeight: 500 }}>Game log — {games.length} game{games.length !== 1 ? "s" : ""}</h2>
+      {sorted.map((g) => {
+        const s = calcGameStats(g);
+        const isOpen = expandedId === g.id;
+        return (
+          <div key={g.id} style={{ background: COLORS.bgPrimary, border: `0.5px solid ${COLORS.borderTertiary}`, borderRadius: 12, marginBottom: 10, overflow: "hidden" }}>
+            <div onClick={() => setExpandedId(isOpen ? null : g.id)} style={{ padding: "14px 16px", cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontWeight: 500, fontSize: 14 }}>{g.opponent || "Unnamed game"}</span>
+                  <span style={{ fontSize: 11, color: COLORS.textSecondary }}>{g.date}</span>
+                </div>
+                <div style={{ display: "flex", gap: 12, marginTop: 4, fontSize: 13, color: COLORS.textSecondary, flexWrap: "wrap" }}>
+                  <span style={{ color: season.color, fontWeight: 500 }}>{s.pts} pts</span>
+                  <span>{s.fgm}/{s.fga} FG ({s.fgPct}%)</span>
+                  <span>3PT {s.threePct}%</span>
+                  <span>{s.ast} ast / <span style={{ color: COLORS.danger }}>{s.to} to</span></span>
+                </div>
+              </div>
+              <span style={{ fontSize: 16, color: COLORS.textSecondary }}>{isOpen ? "▲" : "▼"}</span>
+            </div>
+            {isOpen && (
+              <div style={{ borderTop: `0.5px solid ${COLORS.borderTertiary}`, padding: "14px 16px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 8, marginBottom: 14 }}>
+                  {[
+                    { l: "Points", v: s.pts }, { l: "FG", v: `${s.fgm}/${s.fga}` }, { l: "FG%", v: `${s.fgPct}%` },
+                    { l: "3PT", v: `${s.threeM}/${s.threeA}` }, { l: "3PT%", v: `${s.threePct}%`, hi: season.color },
+                    { l: "FT", v: `${s.ftm}/${s.fta}` }, { l: "Off. reb", v: s.oreb }, { l: "Def. reb", v: s.dreb },
+                    { l: "Assists", v: s.ast }, { l: "Turnovers", v: s.to, hi: COLORS.danger },
+                    { l: "AST/TO", v: s.astToRatio, hi: COLORS.success }, { l: "Steals", v: s.stl }, { l: "Deflections", v: s.dfl },
+                  ].map((item) => (
+                    <div key={item.l} style={{ background: COLORS.bgSecondary, borderRadius: 8, padding: "8px 10px" }}>
+                      <p style={{ margin: 0, fontSize: 10, color: COLORS.textSecondary }}>{item.l}</p>
+                      <p style={{ margin: 0, fontSize: 18, fontWeight: 500, color: item.hi ?? COLORS.textPrimary }}>{item.v}</p>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginBottom: 14 }}>
+                  <p style={{ margin: "0 0 8px", fontSize: 12, color: COLORS.textSecondary }}>Shot breakdown</p>
+                  {SHOT_TYPES.map((st) => {
+                    const att = g.shots.filter((sh) => sh.type === st.id).length;
+                    const made = g.shots.filter((sh) => sh.type === st.id && sh.made).length;
+                    if (!att) return null;
+                    const pct = Math.round((made / att) * 100);
+                    return (
+                      <div key={st.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, color: COLORS.textSecondary, width: 80, flexShrink: 0 }}>{st.label}</span>
+                        <div style={{ flex: 1, height: 5, background: COLORS.bgSecondary, borderRadius: 3 }}>
+                          <div style={{ height: "100%", width: `${pct}%`, background: season.color, borderRadius: 3 }} />
+                        </div>
+                        <span style={{ fontSize: 11, color: COLORS.textSecondary, width: 70, textAlign: "right" }}>{made}/{att} ({pct}%)</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                {g.notes && <p style={{ margin: "0 0 14px", fontSize: 13, color: COLORS.textSecondary, fontStyle: "italic" }}>{g.notes}</p>}
+                <button onClick={() => onDelete(g.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `0.5px solid ${COLORS.danger}`, background: COLORS.dangerBg, color: COLORS.danger, cursor: "pointer", fontSize: 13 }}>🗑 Delete</button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Root: handles auth state ───────────────────────────────────────────────
+function Root() {
+  const [user, setUser] = useState(undefined); // undefined = checking, null = signed out
+
+  useEffect(() => {
+    const { auth, onAuthStateChanged } = fb();
+    const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
+    return unsub;
+  }, []);
+
+  if (user === undefined) {
+    return <div style={{ padding: "3rem", textAlign: "center", color: COLORS.textSecondary, fontFamily: "-apple-system, sans-serif" }}><p>Loading…</p></div>;
+  }
+  if (!user) return <AuthScreen />;
+  return <MainApp user={user} />;
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Root />);
+</script>
+</body>
+</html>
